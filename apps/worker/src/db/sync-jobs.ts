@@ -11,6 +11,7 @@ import {
   or,
   sql,
 } from "drizzle-orm";
+import type { SyncErrorCode } from "@taiwan-fin-hub/shared";
 import { createDrizzle } from "./client";
 import { sanitizeDatabaseError } from "./errors";
 import { syncJobs, connectorSettings } from "./schema";
@@ -72,6 +73,7 @@ export interface SyncJobRow<TConnectorId extends string = string> {
   schedule_mode: SyncScheduleMode;
   preferred_time: string;
   preferred_weekday: number;
+  preferred_weekdays: number[];
   locked_until: string | null;
   locked_by: string | null;
   lock_trigger: SyncTrigger | null;
@@ -80,6 +82,7 @@ export interface SyncJobRow<TConnectorId extends string = string> {
   last_success_at: string | null;
   last_status: SyncStatus | null;
   last_error: string | null;
+  last_error_code: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -110,6 +113,10 @@ export const syncJobSelection = {
   schedule_mode: sql<SyncJobRow["schedule_mode"]>`${syncJobs.scheduleMode}`,
   preferred_time: syncJobs.preferredTime,
   preferred_weekday: syncJobs.preferredWeekday,
+  preferred_weekdays:
+    sql`COALESCE(${syncJobs.preferredWeekdays}, json_array(${syncJobs.preferredWeekday}))`.mapWith(
+      syncJobs.preferredWeekdays,
+    ),
   locked_until: syncJobs.lockedUntil,
   locked_by: syncJobs.lockedBy,
   lock_trigger: sql<SyncJobRow["lock_trigger"]>`${syncJobs.lockTrigger}`,
@@ -118,6 +125,7 @@ export const syncJobSelection = {
   last_success_at: syncJobs.lastSuccessAt,
   last_status: sql<SyncJobRow["last_status"]>`${syncJobs.lastStatus}`,
   last_error: syncJobs.lastError,
+  last_error_code: syncJobs.lastErrorCode,
   created_at: syncJobs.createdAt,
   updated_at: syncJobs.updatedAt,
 };
@@ -129,7 +137,7 @@ export function nextSyncRunAt(
   preferredTime: string,
   now = new Date(),
   _anchor?: string,
-  preferredWeekday = 1,
+  preferredWeekdays = [1],
 ) {
   if (intervalMinutes < 1440) {
     return new Date(now.getTime() + intervalMinutes * 60_000).toISOString();
@@ -155,12 +163,14 @@ export function nextSyncRunAt(
     ) - TAIPEI_OFFSET_MS;
 
   if (intervalMinutes === 10080) {
-    const safeWeekday = Number.isInteger(preferredWeekday)
-      ? Math.min(6, Math.max(0, preferredWeekday))
-      : 1;
-    const daysAhead = (safeWeekday - taipeiNow.getUTCDay() + 7) % 7;
-    candidate += daysAhead * 86_400_000;
-    if (candidate <= now.getTime()) candidate += 7 * 86_400_000;
+    candidate = Math.min(
+      ...preferredWeekdays.map((day) => {
+        let next =
+          candidate + ((day - taipeiNow.getUTCDay() + 7) % 7) * 86_400_000;
+        if (next <= now.getTime()) next += 7 * 86_400_000;
+        return next;
+      }),
+    );
   } else if (candidate <= now.getTime()) {
     candidate += 86_400_000;
   }
@@ -221,6 +231,7 @@ export async function acquireSyncJobLock(
       lockedUntil,
       lockTrigger: input.trigger,
       lockScope: input.scope,
+      lockPhase: null,
       updatedAt: now.toISOString(),
     })
     .where(
@@ -276,9 +287,32 @@ export async function releaseSyncJobLock(
       lockedUntil: null,
       lockTrigger: null,
       lockScope: null,
+      lockPhase: null,
       updatedAt: new Date().toISOString(),
     })
     .where(and(eq(syncJobs.id, lockRowId), eq(syncJobs.lockedBy, runId)))
+    .run()
+    .catch((error) => {
+      throw sanitizeDatabaseError(error);
+    });
+}
+
+/** 只更新仍持有有效鎖的 owner；鎖釋放後遲到的進度不會覆寫。 */
+export async function updateSyncJobLockPhase(
+  db: D1Database,
+  input: { lockRowId: string; runId: string; phase: string },
+) {
+  const now = new Date().toISOString();
+  await createDrizzle(db)
+    .update(syncJobs)
+    .set({ lockPhase: input.phase, updatedAt: now })
+    .where(
+      and(
+        eq(syncJobs.id, input.lockRowId),
+        eq(syncJobs.lockedBy, input.runId),
+        gt(syncJobs.lockedUntil, now),
+      ),
+    )
     .run()
     .catch((error) => {
       throw sanitizeDatabaseError(error);
@@ -296,13 +330,15 @@ export async function completeSyncJob(
     job.preferred_time,
     now,
     job.next_run_at,
-    job.preferred_weekday,
+    job.preferred_weekdays,
   );
   const result = await createDrizzle(db)
     .update(syncJobs)
     .set({
+      enabled: sql`CASE WHEN ${syncJobs.lastSuccessAt} IS NULL THEN 1 ELSE ${syncJobs.enabled} END`,
       lastStatus: "success",
       lastError: null,
+      lastErrorCode: null,
       lastRunAt: now.toISOString(),
       lastSuccessAt: now.toISOString(),
       nextRunAt,
@@ -321,10 +357,16 @@ export async function completeSyncJob(
   return result.meta.changes === 1;
 }
 
+export type SyncFailureInput = {
+  status: SyncStatus;
+  errorMessage: string;
+  errorCode?: SyncErrorCode | null;
+};
+
 export async function failSyncJob(
   db: D1Database,
   job: SyncJobRow,
-  input: { status: SyncStatus; errorMessage: string },
+  input: SyncFailureInput,
   runId: string,
 ) {
   const now = new Date();
@@ -335,7 +377,7 @@ export async function failSyncJob(
           job.preferred_time,
           now,
           job.next_run_at,
-          job.preferred_weekday,
+          job.preferred_weekdays,
         )
       : job.next_run_at;
   const result = await createDrizzle(db)
@@ -343,6 +385,7 @@ export async function failSyncJob(
     .set({
       lastStatus: input.status,
       lastError: input.errorMessage,
+      lastErrorCode: input.errorCode ?? null,
       lastRunAt: now.toISOString(),
       nextRunAt,
       updatedAt: now.toISOString(),
@@ -380,7 +423,7 @@ export async function markManualSyncFailure(
   db: D1Database,
   connectorId: string,
   scope: string,
-  input: { status: SyncStatus; errorMessage: string },
+  input: SyncFailureInput,
   runId: string,
 ) {
   const now = new Date().toISOString();
@@ -389,6 +432,7 @@ export async function markManualSyncFailure(
     .set({
       lastStatus: input.status,
       lastError: input.errorMessage,
+      lastErrorCode: input.errorCode ?? null,
       lastRunAt: now,
       updatedAt: now,
     })

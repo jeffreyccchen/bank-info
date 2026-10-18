@@ -30,6 +30,22 @@ database_name = "taiwan-fin-hub"
 # Cloudflare automatically provisions or resolves the D1 binding on deploy.
 migrations_dir = "apps/worker/migrations"
 
+[[durable_objects.bindings]]
+name = "MEGABANK_EGRESS"
+class_name = "MegabankEgress"
+
+[[durable_objects.bindings]]
+name = "FUBON_EGRESS"
+class_name = "FubonEgress"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["MegabankEgress"]
+
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["FubonEgress"]
+
 [observability]
 enabled = true
 head_sampling_rate = 1
@@ -37,3 +53,6 @@ head_sampling_rate = 1
 [observability.logs]
 enabled = true
 invocation_logs = true
+
+[observability.traces]
+enabled = true

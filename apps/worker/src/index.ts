@@ -20,9 +20,12 @@ import {
 } from "./features/sync/scheduling/queue";
 import { accessMiddleware } from "./middleware/access";
 import { connectorContextMiddleware } from "./middleware/connector-context";
-import type { Env, ScheduledSyncQueueMessage } from "./platform/env";
+import type { Env, SyncQueueMessage } from "./platform/env";
 import { honoFactory } from "./platform/hono";
 import { apiErrorResponse, demoReadOnlyMiddleware } from "./platform/http";
+
+export { MegabankEgress } from "./platform/megabank-egress-object";
+export { FubonEgress } from "./platform/fubon-egress-object";
 
 export const app = honoFactory.createApp();
 export const api = honoFactory.createApp();
@@ -57,7 +60,7 @@ export default {
   async scheduled(_controller, env, ctx) {
     ctx.waitUntil(enqueueScheduledSync(env));
   },
-  async queue(batch: MessageBatch<ScheduledSyncQueueMessage>, env) {
+  async queue(batch: MessageBatch<SyncQueueMessage>, env) {
     await consumeScheduledSyncQueue(batch, env);
   },
-} satisfies ExportedHandler<Env, ScheduledSyncQueueMessage>;
+} satisfies ExportedHandler<Env, SyncQueueMessage>;

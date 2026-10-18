@@ -6,7 +6,7 @@ import {
   bankTransactions,
   creditCardBills,
 } from "../../db";
-import { and, asc, desc, eq, isNull, ne, sql } from "drizzle-orm";
+import { and, asc, desc, eq, isNull, lt, ne, sql } from "drizzle-orm";
 import { alias } from "drizzle-orm/sqlite-core";
 import type { TransactionPageCursor } from "../investments/repository";
 import type { MonthDateRange } from "../../platform/month-range";
@@ -146,9 +146,9 @@ export async function listBankAccounts(db: D1Database) {
       institutionName: account.institutionName,
       accountName: account.accountName,
       accountType: account.accountType,
-      loanCategory: sql<"housing" | "other" | null>`${account.loanCategory}`.as(
-        "loanCategory",
-      ),
+      loanCategory: sql<
+        "housing" | "personal" | "other" | null
+      >`${account.loanCategory}`.as("loanCategory"),
       loanInterestRate: account.loanInterestRate,
       currency: account.currency,
       openedDate: account.openedDate,
@@ -272,6 +272,26 @@ export async function listBankTransactionsForTransferMatching(
               SELECT value FROM json_each(${JSON.stringify(matchDays)})
             )`
           : undefined,
+      ),
+    )
+    .all();
+}
+
+/** Card purchases that refunds on the given cards may return. */
+export async function listBankTransactionsForRefundMatching(
+  db: D1Database,
+  accountIds: string[],
+  range: { from: string; to: string },
+) {
+  if (accountIds.length === 0) return [];
+  return bankTransactionQuery(db)
+    .where(
+      and(
+        visibleBankTransactionFilter,
+        lt(txn.amount, 0),
+        sql`${txn.accountId} IN (SELECT value FROM json_each(${JSON.stringify(accountIds)}))`,
+        sql`(${bankTransactionDay}) >= ${range.from}`,
+        sql`(${bankTransactionDay}) <= ${range.to}`,
       ),
     )
     .all();

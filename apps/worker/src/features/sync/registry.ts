@@ -42,10 +42,16 @@ import {
   type MegabankSyncOverrides,
 } from "../../sources/megabank/sync";
 import {
+  prepareFubonCaptchaSession,
+  syncFubon,
+  type FubonSyncOverrides,
+} from "../../sources/fubon/sync";
+import {
   syncCathaybk,
   type CathaySyncOverrides,
 } from "../../sources/cathaybk/sync";
 import { syncCtbc } from "../../sources/ctbc/sync";
+import type { CtbcSyncOverrides } from "../../sources/ctbc/mobile-api";
 import { syncSkbank } from "../../sources/skbank/sync";
 import { syncEsun } from "../../sources/esun/sync";
 import {
@@ -90,7 +96,8 @@ export const connectorRuntimeRegistry: Record<
       syncCathaybk(env, trigger, overrides as CathaySyncOverrides),
   },
   ctbc: {
-    run: (env, trigger) => syncCtbc(env, trigger),
+    run: (env, trigger, _scope, overrides) =>
+      syncCtbc(env, trigger, overrides as CtbcSyncOverrides),
   },
   skbank: {
     run: (env, trigger) => syncSkbank(env, trigger),
@@ -139,6 +146,11 @@ export const connectorRuntimeRegistry: Record<
     run: (env, trigger, _scope, overrides) =>
       syncMegabank(env, trigger, overrides as MegabankSyncOverrides),
     prepareChallenge: prepareMegabankCaptchaSession,
+  },
+  fubon: {
+    run: (env, trigger, _scope, overrides) =>
+      syncFubon(env, trigger, overrides as FubonSyncOverrides),
+    prepareChallenge: prepareFubonCaptchaSession,
   },
 };
 

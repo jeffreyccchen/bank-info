@@ -7,6 +7,7 @@ import type {
 export type SyncNotificationEvent = {
   connectorId: ConnectorId;
   status: SyncNotificationStatus;
+  trigger?: "manual" | "scheduled";
 };
 
 export type PushNotificationPayload = {
@@ -32,6 +33,7 @@ const connectorLabels: Record<ConnectorId, string> = {
   firstbank: "第一銀行",
   megabank: "兆豐銀行",
   rakuten: "樂天國際銀行",
+  fubon: "台北富邦銀行",
 };
 
 export function syncNotificationPayload(
@@ -41,7 +43,7 @@ export function syncNotificationPayload(
   if (event.status === "success") {
     return {
       title: "同步完成",
-      body: `${connector}已完成排程同步，開啟 App 查看結果。`,
+      body: `${connector}已完成${event.trigger === "manual" ? "" : "排程"}同步，開啟 App 查看結果。`,
       url: "/#/overview",
       tag: `sync-${event.connectorId}-success`,
     };

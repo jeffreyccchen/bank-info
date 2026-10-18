@@ -8,10 +8,10 @@
 
 ## 目錄
 
-- Tables：31
-- Explicit indexes：44
+- Tables：32
+- Explicit indexes：46
 - Other objects：0
-- Migrations：51
+- Migrations：57
 
 ## Tables
 
@@ -35,6 +35,7 @@
 | [`invoice_transaction_preferences`](#invoice_transaction_preferences) | 使用者對電子發票與銀行交易是否關聯的決策。 | 5 | 2 | 2 |
 | [`invoices`](#invoices) | 電子發票的抬頭與總額主檔。 | 10 | 0 | 2 |
 | [`manual_assets`](#manual_assets) | 使用者手動登錄、無法由銀行或投資連接器同步的資產。 | 6 | 0 | 0 |
+| [`manual_sync_runs`](#manual_sync_runs) | 使用者按下同步後交由 Queue consumer 執行的背景手動同步，讓前端離開或重新整理不影響同步。 | 11 | 0 | 2 |
 | [`net_worth_history`](#net_worth_history) | 按日期保存的淨資產或資產類別歷史數值，用於圖表與歷史查詢。 | 6 | 0 | 2 |
 | [`notification_preferences`](#notification_preferences) | 此單一部署的同步推播偏好設定。 | 5 | 0 | 0 |
 | [`push_subscriptions`](#push_subscriptions) | 瀏覽器 Web Push 裝置訂閱資料。 | 6 | 0 | 0 |
@@ -43,8 +44,8 @@
 | [`sync_activity_changes`](#sync_activity_changes) | 與金融資料 promotion 同一 transaction 保存的新增紀錄與入帳事件。 | 5 | 1 | 0 |
 | [`sync_activity_details`](#sync_activity_details) | 報告完成時沿用活動配對規則產生的活動展示快照。 | 3 | 1 | 0 |
 | [`sync_activity_runs`](#sync_activity_runs) | 同步執行與排程報告的明確關聯，涵蓋原始同步及成功的手動補救。 | 7 | 1 | 1 |
-| [`sync_jobs`](#sync_jobs) | 每個連接器與同步範圍的排程、鎖定狀態與最近執行結果。 | 19 | 0 | 1 |
-| [`sync_schedule_settings`](#sync_schedule_settings) | 所有使用 inherit 模式之同步工作的全域預設排程。 | 6 | 0 | 0 |
+| [`sync_jobs`](#sync_jobs) | 每個連接器與同步範圍的排程、鎖定狀態與最近執行結果。 | 22 | 0 | 1 |
+| [`sync_schedule_settings`](#sync_schedule_settings) | 所有使用 inherit 模式之同步工作的全域預設排程。 | 7 | 0 | 0 |
 | [`sync_write_staging`](#sync_write_staging) | 同步流程寫入正式資料表前的暫存資料。 | 5 | 0 | 1 |
 | [`tdcc_sync_run_items`](#tdcc_sync_run_items) | 集保持久化同步中，依帳戶、任務與分頁拆分的工作及取得結果。 | 18 | 1 | 2 |
 | [`tdcc_sync_runs`](#tdcc_sync_runs) | 集保 e 存摺跨 Queue invocation 執行的持久化同步記錄與接續狀態。 | 25 | 2 | 2 |
@@ -75,8 +76,8 @@
 | 15 | `opened_date` | 銀行提供的定存起息日；來源未提供時為 NULL。 | TEXT | YES | — | — | — |
 | 16 | `maturity_date` | 銀行提供的定存到期日；不作為自動結清的判定條件。 | TEXT | YES | — | — | — |
 | 17 | `inactive_at` | 同步確認來源不再列出定存的觀測時間，不是銀行實際結清日；有效帳戶為 NULL。 | TEXT | YES | — | — | — |
-| 18 | `loan_category` | 貸款類別，例如 housing（房屋貸款）或 other（其他貸款）。 | TEXT | YES | — | — | — |
-| 19 | `loan_interest_rate` | 貸款年利率百分比；銀行未提供或無法解析時為 NULL。 | REAL | YES | — | — | — |
+| 18 | `loan_interest_rate` | 貸款年利率百分比；銀行未提供或無法解析時為 NULL。 | REAL | YES | — | — | — |
+| 19 | `loan_category` | 貸款類別：housing（房屋貸款）、personal（信用貸款）或 other（其他貸款）。 | TEXT | YES | — | — | — |
 
 #### Foreign keys
 
@@ -110,7 +111,11 @@ CREATE TABLE "bank_accounts" (
   bank_code TEXT,
   account_last4 TEXT,
   canonical_account_id TEXT REFERENCES "bank_accounts" (id),
-  credit_limit INTEGER, opened_date TEXT, maturity_date TEXT, inactive_at TEXT, loan_category TEXT CHECK (loan_category IS NULL OR loan_category IN ('housing', 'other')), loan_interest_rate REAL,
+  credit_limit INTEGER, opened_date TEXT, maturity_date TEXT, inactive_at TEXT, loan_interest_rate REAL, loan_category TEXT
+CHECK (
+  loan_category IS NULL
+  OR loan_category IN ('housing', 'personal', 'other')
+),
   UNIQUE (connector_id, source_id)
 )
 ```
@@ -1017,6 +1022,58 @@ CREATE TABLE "manual_assets" (
 , currency TEXT NOT NULL DEFAULT 'TWD')
 ```
 
+### `manual_sync_runs`
+
+> 用途：使用者按下同步後交由 Queue consumer 執行的背景手動同步，讓前端離開或重新整理不影響同步。
+> 注意：每個來源同時最多一個 queued 或 running run；來源的同步鎖被其他同步占用時不建立。Queue 訊息只帶 run ID，不保存憑證、OTP、驗證碼或 session；需要使用者輸入的 challenge 仍只存於來源的加密設定。只有持有同步鎖的 queued run 能轉為 running，重送訊息不會再次登入銀行。已結案超過 7 天的 run 由 Cron 恢復流程清除。
+
+#### Columns
+
+| 順序 | 欄位 | 意義 | SQLite type | 可為 NULL | 預設值 | PK 順序 | Generated |
+| ---: | --- | --- | --- | :---: | --- | ---: | --- |
+| 1 | `id` | 背景執行 ID，也是執行期間的同步鎖 owner。 | TEXT | NO | — | 1 | — |
+| 2 | `connector_id` | 要同步的來源。 | TEXT | NO | — | — | — |
+| 3 | `scope` | 同步範圍；一般來源為 all。 | TEXT | NO | 'all' | — | — |
+| 4 | `status` | queued 排隊中、running 執行中、completed 完成、failed 失敗、needs_user_action 需要使用者處理、cancelled 已取消。 | TEXT | NO | — | — | — |
+| 5 | `error_code` | 失敗或需要處理時的 API 錯誤代碼，供前端決定後續操作。 | TEXT | YES | — | — | — |
+| 6 | `last_error` | 已遮蔽敏感資訊的錯誤訊息。 | TEXT | YES | — | — | — |
+| 7 | `retry_count` | 登入前因 Browser Run 容量不足而重新排隊的次數。 | INTEGER | NO | 0 | — | — |
+| 8 | `created_at` | 排入佇列的時間，用於判斷排隊逾時。 | TEXT | NO | — | — | — |
+| 9 | `started_at` | Queue consumer 取得同步鎖並開始執行的時間；重新排隊時清除。 | TEXT | YES | — | — | — |
+| 10 | `updated_at` | 最後一次狀態轉換的時間。 | TEXT | NO | — | — | — |
+| 11 | `completed_at` | 完成、失敗、需要處理或取消而結案的時間。 | TEXT | YES | — | — | — |
+
+#### Foreign keys
+
+—
+
+#### Indexes
+
+| Index | Unique | Partial | 欄位 | 定義 |
+| --- | :---: | :---: | --- | --- |
+| `idx_manual_sync_runs_completed` | 否 | 否 | `completed_at` | `CREATE INDEX idx_manual_sync_runs_completed<br>  ON manual_sync_runs (completed_at DESC)` |
+| `idx_manual_sync_runs_one_active` | 是 | 是 | `connector_id` | `CREATE UNIQUE INDEX idx_manual_sync_runs_one_active<br>  ON manual_sync_runs (connector_id)<br>  WHERE status IN ('queued', 'running')` |
+
+#### DDL
+
+```sql
+CREATE TABLE manual_sync_runs (
+  id TEXT PRIMARY KEY NOT NULL,
+  connector_id TEXT NOT NULL,
+  scope TEXT NOT NULL DEFAULT 'all',
+  status TEXT NOT NULL CHECK (status IN (
+    'queued', 'running', 'completed', 'failed', 'needs_user_action', 'cancelled'
+  )),
+  error_code TEXT,
+  last_error TEXT,
+  retry_count INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL,
+  started_at TEXT,
+  updated_at TEXT NOT NULL,
+  completed_at TEXT
+)
+```
+
 ### `net_worth_history`
 
 > 用途：按日期保存的淨資產或資產類別歷史數值，用於圖表與歷史查詢。
@@ -1361,7 +1418,10 @@ CREATE TABLE sync_activity_runs (
 | 16 | `updated_at` | 同步工作最後更新的時間。 | TEXT | NO | — | — | — |
 | 17 | `schedule_mode` | 排程模式；inherit 使用全域設定，custom 使用工作自己的設定。 | TEXT | NO | 'inherit' | — | — |
 | 18 | `preferred_time` | 每日或每週排程偏好的台北時間。 | TEXT | NO | '06:00' | — | — |
-| 19 | `preferred_weekday` | 每週排程的星期，0 代表週日、6 代表週六。 | INTEGER | NO | 1 | — | — |
+| 19 | `preferred_weekday` | 每週排程的單日相容欄位，0 代表週日、6 代表週六；有星期清單時保存清單第一天。 | INTEGER | NO | 1 | — | — |
+| 20 | `preferred_weekdays` | 每週執行日的 JSON 陣列，0 代表週日、6 代表週六；NULL 沿用 preferred_weekday 單日設定。 | TEXT | YES | — | — | — |
+| 21 | `last_error_code` | 最近一次失敗或需要使用者處理的 API 錯誤代碼，供前端接續驗證流程；成功時清空。 | TEXT | YES | — | — | — |
+| 22 | `lock_phase` | 持有同步鎖的一般同步目前階段：login 登入、fetching 取得資料、saving 儲存結果；取得或釋放鎖時清空。 | TEXT | YES | — | — | — |
 
 #### Foreign keys
 
@@ -1394,7 +1454,7 @@ CREATE TABLE "sync_jobs" (
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL, schedule_mode TEXT NOT NULL DEFAULT 'inherit'
   CHECK (schedule_mode IN ('inherit', 'custom')), preferred_time TEXT NOT NULL DEFAULT '06:00', preferred_weekday INTEGER NOT NULL DEFAULT 1
-  CHECK (preferred_weekday BETWEEN 0 AND 6),
+  CHECK (preferred_weekday BETWEEN 0 AND 6), preferred_weekdays TEXT, last_error_code TEXT, lock_phase TEXT,
   UNIQUE (connector_id, scope)
 )
 ```
@@ -1413,7 +1473,8 @@ CREATE TABLE "sync_jobs" (
 | 3 | `preferred_time` | 預設每日或每週執行時間，使用台北時間。 | TEXT | NO | — | — | — |
 | 4 | `timezone` | 排程使用的時區，目前為 Asia/Taipei。 | TEXT | NO | — | — | — |
 | 5 | `updated_at` | 全域排程最後更新的時間。 | TEXT | NO | — | — | — |
-| 6 | `preferred_weekday` | 每週排程的預設星期，0 代表週日、6 代表週六。 | INTEGER | NO | 1 | — | — |
+| 6 | `preferred_weekday` | 每週排程的預設單日相容欄位，0 代表週日、6 代表週六；有星期清單時保存清單第一天。 | INTEGER | NO | 1 | — | — |
+| 7 | `preferred_weekdays` | 每週預設執行日的 JSON 陣列，0 代表週日、6 代表週六；NULL 沿用 preferred_weekday 單日設定。 | TEXT | YES | — | — | — |
 
 #### Foreign keys
 
@@ -1433,7 +1494,7 @@ CREATE TABLE "sync_schedule_settings" (
   timezone TEXT NOT NULL,
   updated_at TEXT NOT NULL
 , preferred_weekday INTEGER NOT NULL DEFAULT 1
-  CHECK (preferred_weekday BETWEEN 0 AND 6))
+  CHECK (preferred_weekday BETWEEN 0 AND 6), preferred_weekdays TEXT)
 ```
 
 ### `sync_write_staging`
@@ -1693,6 +1754,12 @@ Migration 是 schema 演進的 source of truth；若要了解某欄位的變更�
 - [`0051_rakuten_sync_job.sql`](../apps/worker/migrations/0051_rakuten_sync_job.sql)
 - [`0052_bank_loan_overview.sql`](../apps/worker/migrations/0052_bank_loan_overview.sql)
 - [`0053_scheduled_sync_loan_debt.sql`](../apps/worker/migrations/0053_scheduled_sync_loan_debt.sql)
+- [`0054_weekly_sync_days.sql`](../apps/worker/migrations/0054_weekly_sync_days.sql)
+- [`0055_personal_loan_category.sql`](../apps/worker/migrations/0055_personal_loan_category.sql)
+- [`0056_manual_sync_runs.sql`](../apps/worker/migrations/0056_manual_sync_runs.sql)
+- [`0057_sync_job_lock_phase.sql`](../apps/worker/migrations/0057_sync_job_lock_phase.sql)
+- [`0058_fubon_sync_job.sql`](../apps/worker/migrations/0058_fubon_sync_job.sql)
+- [`0059_reward_donation_categories.sql`](../apps/worker/migrations/0059_reward_donation_categories.sql)
 
 ## 程式碼導覽
 

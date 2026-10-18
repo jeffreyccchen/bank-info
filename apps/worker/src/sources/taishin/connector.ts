@@ -15,6 +15,7 @@ import puppeteer, {
   type HTTPResponse,
 } from "@cloudflare/puppeteer";
 import { BANK_SYNC_MONTHS } from "../sync-window";
+import { reportSyncProgress } from "../sync-progress";
 import { isNoCreditCardMessage } from "../credit-card-status";
 import {
   parseTaishinCreditCardData,
@@ -25,10 +26,12 @@ import {
 } from "./protocol";
 import {
   fetchTaishinDeposits,
+  TaishinDepositNoPermissionError,
   TaishinDepositProtocolError,
 } from "./deposit-protocol";
 
 const RWD_URL = "https://my.taishinbank.com.tw/TIBNetBank/svc/rwd/index.html";
+const BANK_ORIGIN = "https://my.taishinbank.com.tw";
 const API_ROOT = "/TIBNetBank/svc";
 const SESSION_CHECK_PATH = `${API_ROOT}/web/common/sessioncheck`;
 const SUMMARY_PATH = `${API_ROOT}/web4/rb0708rwd/doXTPA`;
@@ -41,7 +44,9 @@ const TAISHIN_AUTO_OCR_ATTEMPTS = 6;
 const CAPTCHA_KEEP_ALIVE_MS = 150_000;
 const CAPTCHA_VALIDITY_MS = 120_000;
 const CAPTCHA_IMAGE_TIMEOUT_MS = 10_000;
-const CAPTCHA_PAGE_RETRY_ATTEMPTS = 1;
+const CAPTCHA_IMAGE_SELECTOR = "img._field_item__verify-code";
+const CAPTCHA_IMAGE_PATH = `${API_ROOT}/web/shuffle/NonSessionShuffle`;
+const CAPTCHA_TOKEN_PATH = `${API_ROOT}/web/login/getToken`;
 const LOGIN_RESULT_ATTEMPTS = 10;
 const LOGIN_RESULT_POLL_MS = 500;
 const POST_LOGIN_PAGE_TIMEOUT_MS = 15_000;
@@ -311,6 +316,7 @@ export function createTaishinConnector(
           );
         }
         authenticated = true;
+        reportSyncProgress("fetching");
         stage = "dismiss_password_reminder";
         pageContext = await dismissPasswordReminder(page, reusedSessionFrame);
 
@@ -328,8 +334,10 @@ export function createTaishinConnector(
             throw error;
           }
           stage = "login";
+          reportSyncProgress("login");
           pageContext = await loginWithOcr(page, config, recognizeCaptcha);
           authenticated = true;
+          reportSyncProgress("fetching");
           stage = "dismiss_password_reminder";
           pageContext = await dismissPasswordReminder(page);
           data = await fetchTaishinBankData(
@@ -429,6 +437,8 @@ async function loginWithOcr(
 ) {
   let ocrAttempts = 0;
   let loginRequests = 0;
+  let loginFrame: BrowserPage | undefined;
+  const recognizedImageHashes = new Set<string>();
   while (
     ocrAttempts < TAISHIN_AUTO_OCR_ATTEMPTS &&
     loginRequests < TAISHIN_AUTO_LOGIN_ATTEMPTS
@@ -437,16 +447,51 @@ async function loginWithOcr(
     const previousLoginRequests = loginRequests;
     let captchaValid = false;
     let outcome = "failed";
+    let capture:
+      Awaited<ReturnType<typeof openLoginAndCaptureCaptcha>> | undefined;
+    let imageChanged: boolean | null = null;
+    let captchaRefreshes = 0;
+    let imageByteLength: number | undefined;
     try {
-      const capture = initialCapture;
+      if (loginFrame) {
+        captchaRefreshes += 1;
+        capture = {
+          frame: loginFrame,
+          captcha: await refreshCaptcha(page, loginFrame),
+        };
+      } else {
+        capture =
+          initialCapture ?? (await openLoginAndCaptureCaptcha(page, config));
+      }
       initialCapture = undefined;
-      const { frame, captcha } =
-        capture ?? (await openLoginAndCaptureCaptcha(page, config));
+      loginFrame = capture.frame;
+      let imageBytes = toArrayBuffer(capture.captcha.bytes);
+      let imageHash = await captchaImageHash(imageBytes);
+      imageByteLength = imageBytes.byteLength;
+      if (recognizedImageHashes.size > 0) {
+        imageChanged = !recognizedImageHashes.has(imageHash);
+        if (!imageChanged) {
+          captchaRefreshes += 1;
+          capture = {
+            frame: loginFrame,
+            captcha: await refreshCaptcha(page, loginFrame),
+          };
+          imageBytes = toArrayBuffer(capture.captcha.bytes);
+          imageHash = await captchaImageHash(imageBytes);
+          imageByteLength = imageBytes.byteLength;
+          imageChanged = !recognizedImageHashes.has(imageHash);
+        }
+        if (!imageChanged) {
+          outcome = "captcha_unchanged";
+          throw new TaishinCaptchaUnavailableError(
+            "台新驗證碼換圖失敗，使用官方換圖後仍取得相同圖片，請稍後再試。",
+          );
+        }
+      }
+      recognizedImageHashes.add(imageHash);
+      const { frame, captcha } = capture;
       ocrAttempts += 1;
-      const answer = await recognizeCaptcha(
-        toArrayBuffer(captcha.bytes),
-        captcha.digitCount,
-      );
+      const answer = await recognizeCaptcha(imageBytes, captcha.digitCount);
       if (answer === null) {
         outcome = "ocr_invalid";
         continue;
@@ -478,6 +523,11 @@ async function loginWithOcr(
           loginRequests: loginRequests - previousLoginRequests,
           totalLoginRequests: loginRequests,
           outcome,
+          imageChanged,
+          captchaRefreshes,
+          imageWidth: capture?.captcha.width,
+          imageHeight: capture?.captcha.height,
+          imageByteLength,
           elapsedMs: Date.now() - startedAt,
         }),
       );
@@ -857,6 +907,10 @@ async function postJson(
         throw new TaishinVerificationRequiredError(
           "台新銀行 session 已失效，需要重新登入。",
         );
+      // Online banking may list an account whose live balance it cannot
+      // query, such as a securities settlement account; it answers EBF0015.
+      if (path.endsWith("/web1/rb0101/query") && detail.startsWith("(EBF0015)"))
+        throw new TaishinDepositNoPermissionError();
       throw new TaishinConnectionError(
         `台新銀行 API ${endpoint} 回傳錯誤${detail ? `：${detail}` : ""}。`,
       );
@@ -864,6 +918,7 @@ async function postJson(
     return payload;
   } catch (error) {
     if (error instanceof TaishinNoCreditCardError) throw error;
+    if (error instanceof TaishinDepositNoPermissionError) throw error;
     if (error instanceof TaishinVerificationRequiredError) throw error;
     if (error instanceof TaishinConnectionError) throw error;
     if (diagnostic) diagnostic.validJson = false;
@@ -1028,104 +1083,229 @@ async function openLoginAndFill(
 }
 
 async function openLoginAndCaptureCaptcha(page: Page, config: TaishinConfig) {
-  for (let retry = 0; retry <= CAPTCHA_PAGE_RETRY_ATTEMPTS; retry += 1) {
-    const frame = await openLoginAndFill(page, config);
-    try {
-      return { frame, captcha: await captureCaptcha(frame) };
-    } catch (error) {
-      if (
-        !(error instanceof TaishinCaptchaUnavailableError) ||
-        retry >= CAPTCHA_PAGE_RETRY_ATTEMPTS
-      ) {
-        throw error;
-      }
-    }
+  const frame = await openLoginAndFill(page, config);
+  try {
+    return { frame, captcha: await captureCaptcha(frame) };
+  } catch (error) {
+    if (!(error instanceof TaishinCaptchaUnavailableError)) throw error;
+    return { frame, captcha: await refreshCaptcha(page, frame) };
   }
-  throw new TaishinCaptchaUnavailableError(
-    "台新登入頁沒有在期限內取得圖形驗證碼。",
-  );
+}
+
+async function refreshCaptcha(networkPage: Page, frame: BrowserPage) {
+  const startedAt = Date.now();
+  const controller = new AbortController();
+  const waits: Promise<unknown>[] = [];
+  let tokenHttpStatus: number | undefined;
+  let tokenResult: string | undefined;
+  let imageHttpStatus: number | undefined;
+  let sourceChanged = false;
+  let outcome = "request_unavailable";
+  try {
+    const previousSource = await frame.evaluate((selector) => {
+      const image = document.querySelector<HTMLImageElement>(selector);
+      return image?.currentSrc || image?.src;
+    }, CAPTCHA_IMAGE_SELECTOR);
+    const requestFrame =
+      frame === networkPage ? networkPage.mainFrame() : frame;
+    const waitOptions = {
+      timeout: CAPTCHA_IMAGE_TIMEOUT_MS,
+      signal: controller.signal,
+    };
+    // Register before clicking. A response from an earlier, still pending
+    // genAuth() must not satisfy this refresh's token wait.
+    const tokenRequest = networkPage.waitForRequest(
+      (request) =>
+        request.url().split("?")[0] === `${BANK_ORIGIN}${CAPTCHA_TOKEN_PATH}` &&
+        request.method() === "POST" &&
+        request.frame() === requestFrame,
+      waitOptions,
+    );
+    waits.push(tokenRequest);
+    const token = networkPage
+      .waitForResponse(
+        async (response) =>
+          response.url().split("?")[0] ===
+            `${BANK_ORIGIN}${CAPTCHA_TOKEN_PATH}` &&
+          response.request() === (await tokenRequest),
+        waitOptions,
+      )
+      .then(async (response) => {
+        tokenHttpStatus = response.status();
+        outcome = "token_invalid";
+        const payload: unknown = await response.json();
+        const result = isRecord(payload) ? payload.RESULT : undefined;
+        tokenResult = ["NORMAL", "ERROR", "EXPIRED", "RESUME"].includes(
+          typeof result === "string" ? result : "",
+        )
+          ? String(result)
+          : "unrecognized";
+        if (
+          !response.ok() ||
+          !isRecord(payload) ||
+          payload.RESULT !== "NORMAL" ||
+          typeof payload.ECTOKEN !== "string" ||
+          !payload.ECTOKEN
+        ) {
+          throw new TaishinCaptchaUnavailableError(
+            "台新驗證碼換圖未能取得有效 Token，請稍後再試。",
+          );
+        }
+        outcome = "image_unavailable";
+        return payload.ECTOKEN;
+      });
+    waits.push(token);
+    const imageResponse = networkPage.waitForResponse(async (response) => {
+      const url = new URL(response.url());
+      return (
+        url.origin === BANK_ORIGIN &&
+        url.pathname === CAPTCHA_IMAGE_PATH &&
+        response.request().frame() === requestFrame &&
+        url.searchParams.get("TOKEN") === (await token)
+      );
+    }, waitOptions);
+    waits.push(imageResponse);
+    const [, , , response] = await Promise.all([
+      frame.evaluate(
+        ({ selector, origin, path }) => {
+          const image = document.querySelector<HTMLImageElement>(selector);
+          if (!image) throw new Error("CAPTCHA refresh control unavailable");
+          const url = new URL(image.src, document.baseURI);
+          if (url.origin !== origin || url.pathname !== path)
+            throw new Error("CAPTCHA refresh target changed");
+          // Use the bank's genAuth click handler, including while a CAPTCHA
+          // rejection dialog is visible. The next login clears that dialog.
+          image.click();
+        },
+        {
+          selector: CAPTCHA_IMAGE_SELECTOR,
+          origin: BANK_ORIGIN,
+          path: CAPTCHA_IMAGE_PATH,
+        },
+      ),
+      tokenRequest,
+      token,
+      imageResponse,
+    ]);
+    imageHttpStatus = response.status();
+    sourceChanged = response.url() !== previousSource;
+    if (!response.ok() || !sourceChanged) {
+      throw new TaishinCaptchaUnavailableError(
+        "台新驗證碼換圖沒有載入新圖片，請稍後再試。",
+      );
+    }
+    outcome = "capture_failed";
+    const captcha = await captureCaptcha(frame, response.url());
+    outcome = "ready";
+    return captcha;
+  } catch (error) {
+    if (error instanceof TaishinCaptchaUnavailableError) throw error;
+    throw new TaishinCaptchaUnavailableError(
+      "台新驗證碼換圖未完成或圖片尚未就緒，請稍後再試。",
+      error,
+    );
+  } finally {
+    controller.abort();
+    await Promise.allSettled(waits);
+    console.log(
+      JSON.stringify({
+        event: "taishin_captcha_refresh",
+        connectorId: "taishin",
+        outcome,
+        tokenHttpStatus,
+        tokenResult,
+        imageHttpStatus,
+        sourceChanged,
+        elapsedMs: Date.now() - startedAt,
+      }),
+    );
+  }
 }
 
 async function typeInput(page: BrowserPage, selector: string, value: string) {
   await page.type(selector, value, { delay: 20 });
 }
 
-async function captureCaptcha(page: BrowserPage) {
+async function captureCaptcha(page: BrowserPage, expectedSource?: string) {
+  const imageTarget = {
+    selector: CAPTCHA_IMAGE_SELECTOR,
+    origin: BANK_ORIGIN,
+    path: CAPTCHA_IMAGE_PATH,
+    expectedSource,
+  };
   try {
-    await page.waitForFunction(
-      () => {
+    const ready = await page.waitForFunction(
+      ({ selector, origin, path, expectedSource }: typeof imageTarget) => {
         const captchaInput = document.querySelector<HTMLInputElement>(
           'input[data-taishin-field="captcha"]',
         );
         if (!captchaInput) return false;
-        const images = Array.from(
-          document.querySelectorAll<HTMLImageElement>("img"),
-        );
-        const isHinted = (image: HTMLImageElement) => {
-          const hint = [image.id, image.className, image.alt, image.src].join(
-            " ",
-          );
-          return /captcha|驗證|validate|check.?code|verify.?code|shuffle/i.test(
-            hint,
-          );
-        };
-        const hasHintedImage = images.some(isHinted);
-        return images.some((image) => {
-          if (!image.complete || image.naturalWidth <= 0) return false;
-          const rect = image.getBoundingClientRect();
-          if (rect.width < 50 || rect.height < 20) return false;
-          if (hasHintedImage && !isHinted(image)) return false;
-          return true;
-        });
+        const image = document.querySelector<HTMLImageElement>(selector);
+        if (!image?.complete || image.naturalWidth <= 0) return false;
+        const source = image.currentSrc || image.src;
+        const url = new URL(source, document.baseURI);
+        if (
+          url.origin !== origin ||
+          url.pathname !== path ||
+          (expectedSource && source !== expectedSource)
+        )
+          return false;
+        const rect = image.getBoundingClientRect();
+        return rect.width >= 50 && rect.height >= 20;
       },
       { timeout: CAPTCHA_IMAGE_TIMEOUT_MS },
+      imageTarget,
     );
-  } catch {
+    await ready.dispose();
+  } catch (error) {
     throw new TaishinCaptchaUnavailableError(
       "台新登入頁沒有在期限內取得圖形驗證碼。",
+      error,
     );
   }
-  const target = await page.evaluate(() => {
-    const captchaInput = document.querySelector<HTMLInputElement>(
-      'input[data-taishin-field="captcha"]',
-    );
-    if (!captchaInput) return undefined;
-    const inputRect = captchaInput.getBoundingClientRect();
-    const images = Array.from(
-      document.querySelectorAll<HTMLImageElement>("img"),
-    )
-      .filter((image) => image.complete && image.naturalWidth > 0)
-      .map((image) => {
-        const rect = image.getBoundingClientRect();
-        const hint = [image.id, image.className, image.alt, image.src].join(
-          " ",
+  const target = await page
+    .evaluate(
+      async ({
+        selector,
+        origin,
+        path,
+        expectedSource,
+      }: typeof imageTarget) => {
+        const captchaInput = document.querySelector<HTMLInputElement>(
+          'input[data-taishin-field="captcha"]',
         );
+        const image = document.querySelector<HTMLImageElement>(selector);
+        if (!captchaInput || !image?.complete || image.naturalWidth <= 0)
+          return undefined;
+        const source = image.currentSrc || image.src;
+        const url = new URL(source, document.baseURI);
+        if (
+          url.origin !== origin ||
+          url.pathname !== path ||
+          (expectedSource && source !== expectedSource)
+        )
+          return undefined;
+        await image.decode();
+        const rect = image.getBoundingClientRect();
+        if (rect.width < 50 || rect.height < 20) return undefined;
+        const declaredLength = captchaInput.maxLength;
         return {
-          image,
-          score:
-            (/captcha|驗證|validate|check.?code|verify.?code|shuffle/i.test(
-              hint,
-            )
-              ? 1000
-              : 0) -
-            Math.abs(rect.top - inputRect.top) -
-            Math.abs(rect.left - inputRect.right),
-          width: rect.width,
-          height: rect.height,
+          selector,
+          source,
+          digitCount:
+            declaredLength >= 4 && declaredLength <= 8 ? declaredLength : 6,
+          width: Math.round(rect.width),
+          height: Math.round(rect.height),
         };
-      })
-      .filter(({ width, height }) => width >= 50 && height >= 20)
-      .sort((left, right) => right.score - left.score);
-    const image = images[0]?.image;
-    if (!image) return undefined;
-    image.dataset.taishinCaptcha = "image";
-    const declaredLength = captchaInput.maxLength;
-    return {
-      selector: 'img[data-taishin-captcha="image"]',
-      digitCount:
-        declaredLength >= 4 && declaredLength <= 8 ? declaredLength : 6,
-    };
-  });
+      },
+      imageTarget,
+    )
+    .catch((error: unknown) => {
+      throw new TaishinCaptchaUnavailableError(
+        "台新圖形驗證碼尚未解碼或已更新，請稍後再試。",
+        error,
+      );
+    });
   if (!target) {
     throw new TaishinCaptchaUnavailableError(
       "台新登入頁沒有在期限內取得圖形驗證碼。",
@@ -1136,7 +1316,38 @@ async function captureCaptcha(page: BrowserPage) {
     throw new TaishinCaptchaUnavailableError("台新圖形驗證碼已失效。");
   try {
     const bytes = await image.screenshot({ type: "jpeg" });
-    return { bytes, digitCount: target.digitCount };
+    const current = await image.evaluate((element, source) => {
+      const image = element as HTMLImageElement;
+      return (
+        image.isConnected &&
+        image.complete &&
+        image.naturalWidth > 0 &&
+        (image.currentSrc || image.src) === source
+      );
+    }, target.source);
+    if (!current)
+      throw new TaishinCaptchaUnavailableError(
+        "台新圖形驗證碼在擷取時已更新，請稍後再試。",
+      );
+    console.log(
+      JSON.stringify({
+        event: "taishin_captcha_captured",
+        connectorId: "taishin",
+        mode: expectedSource ? "refresh" : "initial",
+        imageWidth: target.width,
+        imageHeight: target.height,
+        imageByteLength:
+          typeof bytes === "string"
+            ? toArrayBuffer(bytes).byteLength
+            : bytes.byteLength,
+      }),
+    );
+    return {
+      bytes,
+      digitCount: target.digitCount,
+      width: target.width,
+      height: target.height,
+    };
   } catch (error) {
     // The image can disappear between readiness checks and the screenshot.
     // No login has been submitted, so use the existing preparation retry.
@@ -1676,6 +1887,13 @@ function toArrayBuffer(bytes: Uint8Array | string) {
   for (let index = 0; index < binary.length; index += 1)
     decoded[index] = binary.charCodeAt(index);
   return decoded.buffer;
+}
+
+async function captchaImageHash(bytes: ArrayBuffer) {
+  const hash = new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
+  return Array.from(hash, (byte) => byte.toString(16).padStart(2, "0")).join(
+    "",
+  );
 }
 
 function isRecord(value: unknown): value is JsonRecord {

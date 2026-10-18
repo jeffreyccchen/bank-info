@@ -1,4 +1,9 @@
-import { isConnectorId } from "@taiwan-fin-hub/shared";
+import {
+  isConnectorId,
+  isSyncIntervalMinutes,
+  type SyncJobResponse,
+  type SyncScheduleResponse,
+} from "@taiwan-fin-hub/shared";
 import { zValidator } from "@hono/zod-validator";
 import type { Hono } from "hono";
 import { z } from "zod";
@@ -17,17 +22,33 @@ import {
 const syncIntervalSchema = z
   .number()
   .int()
-  .refine(
-    (value) => [60, 360, 720, 1440, 10080].includes(value),
-    "Unsupported sync interval.",
-  );
+  .refine(isSyncIntervalMinutes, "Unsupported sync interval.");
 const preferredTimeSchema = z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/);
 const preferredWeekdaySchema = z.number().int().min(0).max(6);
-const syncScheduleUpdateSchema = z.object({
-  intervalMinutes: syncIntervalSchema,
-  preferredTime: preferredTimeSchema,
-  preferredWeekday: preferredWeekdaySchema,
-});
+const preferredWeekdaysSchema = z
+  .array(preferredWeekdaySchema)
+  .min(1)
+  .max(7)
+  .refine((days) => new Set(days).size === days.length, "Duplicate weekdays.")
+  .transform((days) => [...days].sort((a, b) => a - b));
+const syncScheduleUpdateSchema = z
+  .object({
+    intervalMinutes: syncIntervalSchema,
+    preferredTime: preferredTimeSchema,
+    preferredWeekday: preferredWeekdaySchema.optional(),
+    preferredWeekdays: preferredWeekdaysSchema.optional(),
+  })
+  .refine(
+    (data) =>
+      data.preferredWeekdays !== undefined ||
+      data.preferredWeekday !== undefined,
+    "At least one weekday is required.",
+  )
+  .transform((data) => ({
+    intervalMinutes: data.intervalMinutes,
+    preferredTime: data.preferredTime,
+    preferredWeekdays: data.preferredWeekdays ?? [data.preferredWeekday!],
+  }));
 const syncJobUpdateSchema = z
   .object({
     enabled: z.boolean().optional(),
@@ -35,6 +56,7 @@ const syncJobUpdateSchema = z
     intervalMinutes: syncIntervalSchema.optional(),
     preferredTime: preferredTimeSchema.optional(),
     preferredWeekday: preferredWeekdaySchema.optional(),
+    preferredWeekdays: preferredWeekdaysSchema.optional(),
     scheduleMode: z.enum(["inherit", "custom"]).optional(),
   })
   .refine(
@@ -52,7 +74,9 @@ registerSyncScheduleRoutes(syncScheduleRoutes);
 
 function registerSyncScheduleRoutes(api: Hono<AppBindings>) {
   api.get("/sync-schedule", async (c) =>
-    c.json(await getDefaultSyncSchedule(c.env.DB)),
+    c.json(
+      (await getDefaultSyncSchedule(c.env.DB)) satisfies SyncScheduleResponse,
+    ),
   );
 
   api.put(
@@ -66,10 +90,17 @@ function registerSyncScheduleRoutes(api: Hono<AppBindings>) {
       ),
     ),
     async (c) =>
-      c.json(await setDefaultSyncSchedule(c.env.DB, c.req.valid("json"))),
+      c.json(
+        (await setDefaultSyncSchedule(
+          c.env.DB,
+          c.req.valid("json"),
+        )) satisfies SyncScheduleResponse,
+      ),
   );
 
-  api.get("/sync-jobs", async (c) => c.json(await getSyncJobs(c.env.DB)));
+  api.get("/sync-jobs", async (c) =>
+    c.json((await getSyncJobs(c.env.DB)) satisfies SyncJobResponse[]),
+  );
 
   api.patch(
     "/sync-jobs/:connectorId/:scope",
