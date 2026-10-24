@@ -124,6 +124,10 @@ const ENTITY_CONFIG: Record<SyncEntityType, EntityConfig> = {
       "inactive_at",
       "bank_code",
       "account_last4",
+      "autopay_status",
+      "autopay_bank_code",
+      "autopay_account_last4",
+      "autopay_account_source_id",
       "raw_payload",
       "created_at",
       "updated_at",
@@ -142,6 +146,10 @@ const ENTITY_CONFIG: Record<SyncEntityType, EntityConfig> = {
       "inactive_at",
       "bank_code",
       "account_last4",
+      "autopay_status",
+      "autopay_bank_code",
+      "autopay_account_last4",
+      "autopay_account_source_id",
       "raw_payload",
       "updated_at",
     ],
@@ -202,6 +210,8 @@ const ENTITY_CONFIG: Record<SyncEntityType, EntityConfig> = {
       "counterparty",
       "status",
       "transfer_peer_id",
+      "card_last4",
+      "card_name",
       "raw_payload",
       "created_at",
       "updated_at",
@@ -216,6 +226,8 @@ const ENTITY_CONFIG: Record<SyncEntityType, EntityConfig> = {
       "counterparty",
       "status",
       "transfer_peer_id",
+      "card_last4",
+      "card_name",
       "raw_payload",
       "updated_at",
     ],
@@ -562,8 +574,17 @@ function promotionStatement(
             AND date(invoices.invoice_date, '+8 hours') = excluded.invoice_date
           THEN invoices.invoice_date ELSE excluded.invoice_date END`;
       if (entityType === "credit_card_bill") {
-        if (column === "paid_amount")
-          return "paid_amount = COALESCE(excluded.paid_amount, credit_card_bills.paid_amount)";
+        // Partial bill responses must not erase previously confirmed fields.
+        if (
+          [
+            "statement_amount",
+            "minimum_payment",
+            "paid_amount",
+            "payment_due_date",
+            "statement_closing_date",
+          ].includes(column)
+        )
+          return `${column} = COALESCE(excluded.${column}, credit_card_bills.${column})`;
         if (column === "is_paid")
           return `is_paid = CASE
             WHEN credit_card_bills.is_paid = 1 OR excluded.is_paid = 1 THEN 1
@@ -572,6 +593,11 @@ function promotionStatement(
       }
       if (entityType === "bank_account" && column === "currency")
         return "currency = COALESCE(NULLIF(excluded.currency, ''), bank_accounts.currency)";
+      if (entityType === "bank_account" && column.startsWith("autopay_"))
+        // 來源本次沒取得扣款帳戶時整組保留；有明確結果（含未設定）時整組覆寫，
+        // 避免新舊銀行代碼與末四碼混在一起。
+        return `${column} = CASE WHEN excluded.autopay_status IS NULL
+          THEN bank_accounts.${column} ELSE excluded.${column} END`;
       if (
         entityType === "bank_account" &&
         [

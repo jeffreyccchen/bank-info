@@ -1,4 +1,5 @@
 import type { ConnectorId } from "@taiwan-fin-hub/shared";
+import { TAIWAN_BANK_NAMES } from "../../sources/taiwan-banks";
 
 const ESUN_BANK_CODE = "808";
 const CATHAYBK_BANK_CODE = "013";
@@ -12,6 +13,7 @@ const FIRSTBANK_BANK_CODE = "007";
 const MEGABANK_BANK_CODE = "017";
 const TAISHIN_BANK_CODE = "812";
 const FUBON_BANK_CODE = "012";
+const FEIB_BANK_CODE = "805";
 const CONNECTOR_BANK_CODES: ReadonlyMap<string, string> = new Map([
   ["esun", ESUN_BANK_CODE],
   ["cathaybk", CATHAYBK_BANK_CODE],
@@ -25,42 +27,8 @@ const CONNECTOR_BANK_CODES: ReadonlyMap<string, string> = new Map([
   ["megabank", MEGABANK_BANK_CODE],
   ["rakuten", RAKUTEN_BANK_CODE],
   ["fubon", FUBON_BANK_CODE],
+  ["feib", FEIB_BANK_CODE],
 ]);
-const TAIWAN_BANK_NAMES: Record<string, string> = {
-  "004": "台灣銀行",
-  "005": "土地銀行",
-  "006": "合作金庫銀行",
-  "007": "第一銀行",
-  "008": "華南銀行",
-  "009": "彰化銀行",
-  "011": "上海商銀",
-  "012": "台北富邦銀行",
-  "013": "國泰世華銀行",
-  "016": "高雄銀行",
-  "017": "兆豐銀行",
-  "048": "王道銀行",
-  "050": "台灣企銀",
-  "052": "渣打銀行",
-  "053": "台中銀行",
-  "054": "京城銀行",
-  "081": "匯豐銀行",
-  "103": "新光銀行",
-  "108": "陽信銀行",
-  "700": "中華郵政",
-  "803": "聯邦銀行",
-  "805": "遠東銀行",
-  "806": "元大銀行",
-  "807": "永豐銀行",
-  "808": "玉山銀行",
-  "809": "凱基銀行",
-  "810": "星展銀行",
-  "812": "台新銀行",
-  "816": "安泰銀行",
-  "822": "中國信託銀行",
-  "823": "將來銀行",
-  "824": "連線銀行",
-  "826": "樂天銀行",
-};
 
 type BankDisplayRow = {
   sourceId?: string;
@@ -126,6 +94,11 @@ export function deriveBankMatchKey(
     const last4 = sourceId.split(":")[2]?.replace(/\D/g, "").slice(-4) ?? "";
     return { bankCode: FUBON_BANK_CODE, last4: last4 || null };
   }
+  if (connectorId === "feib" && sourceId.startsWith("bank:feib:")) {
+    // sourceId 為 bank:feib:<末四碼>:<帳號雜湊>:<幣別>，不含完整帳號。
+    const last4 = sourceId.split(":")[2]?.replace(/\D/g, "").slice(-4) ?? "";
+    return { bankCode: FEIB_BANK_CODE, last4: last4 || null };
+  }
   if (connectorId === "rakuten" && sourceId.startsWith("bank:rakuten:")) {
     const last4 = sourceId.split(":")[2]?.replace(/\D/g, "").slice(-4) ?? "";
     return { bankCode: RAKUTEN_BANK_CODE, last4: last4 || null };
@@ -143,10 +116,20 @@ export function normalizeBankAccountDisplay<T extends BankDisplayRow>(
   return row.accountType === "credit" ? row : normalizeDepositDisplay(row);
 }
 
-export function normalizeBankTransactionDisplay<T extends BankDisplayRow>(
-  row: T,
-): T {
-  return row.accountType === "credit" ? row : normalizeDepositDisplay(row);
+export function normalizeBankTransactionDisplay<
+  T extends BankDisplayRow & {
+    cardLast4?: string | null;
+    cardName?: string | null;
+  },
+>(row: T) {
+  // Card identity is folded into the account label, keeping the API contract.
+  const { cardLast4, cardName, ...display } = row;
+  if (row.accountType !== "credit") return normalizeDepositDisplay(display);
+  if (!cardLast4) return display;
+  return {
+    ...display,
+    accountName: `${cardName ?? display.accountName ?? "信用卡"} · ${cardLast4}`,
+  };
 }
 
 function normalizeDepositDisplay<T extends BankDisplayRow>(row: T): T {
@@ -157,6 +140,13 @@ function normalizeDepositDisplay<T extends BankDisplayRow>(row: T): T {
     settlement.bankCode ??
     CONNECTOR_BANK_CODES.get(row.connectorId ?? "");
   const accountSuffix = accountSuffixFromSourceId(sourceId);
+  // 連接器組好的「名稱 末四碼 xxxx」（見 sources/deposit-account-name.ts）直接保留。
+  if (hasMatchingAccountSuffix(row.accountName, sourceId))
+    return {
+      ...row,
+      institutionName:
+        (bankCode && TAIWAN_BANK_NAMES[bankCode]) || row.institutionName,
+    };
   return {
     ...row,
     institutionName:
@@ -168,6 +158,17 @@ function normalizeDepositDisplay<T extends BankDisplayRow>(row: T): T {
           : row.accountName
         : accountSuffix || row.accountName,
   };
+}
+
+/** 名稱以「 末四碼 xxxx」或「 末五碼 xxxxx」結尾，且末碼與 sourceId 的帳號一致。 */
+function hasMatchingAccountSuffix(
+  name: string | null | undefined,
+  sourceId: string,
+) {
+  const digits =
+    parseBankAccountSource(sourceId).account?.replace(/\D/g, "") ?? "";
+  const suffix = name?.match(/ 末[四五]碼 (\d{4,5})$/)?.[1];
+  return Boolean(digits && suffix && digits.endsWith(suffix));
 }
 
 function parseBankAccountSource(sourceId: string): {
@@ -201,6 +202,8 @@ function parseBankAccountSource(sourceId: string): {
   if (megabank) return { bankCode: MEGABANK_BANK_CODE, account: megabank[1] };
   const fubon = sourceId.match(/^bank:fubon:([^:]+)/);
   if (fubon) return { bankCode: FUBON_BANK_CODE, account: fubon[1] };
+  const feib = sourceId.match(/^bank:feib:([^:]+)/);
+  if (feib) return { bankCode: FEIB_BANK_CODE, account: feib[1] };
   const rakuten = sourceId.match(/^bank:rakuten:([^:]+)/);
   if (rakuten) return { bankCode: RAKUTEN_BANK_CODE, account: rakuten[1] };
   return {};

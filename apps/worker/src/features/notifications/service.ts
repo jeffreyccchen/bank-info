@@ -1,9 +1,13 @@
 import type {
   NotificationConfig,
   NotificationPreferences,
+  PaymentReminder,
   PushSubscriptionInput,
 } from "@taiwan-fin-hub/shared";
+import { collectPaymentReminders, taipeiDateKey } from "@taiwan-fin-hub/shared";
 import { sanitizeDatabaseError } from "../../db";
+import { getBankAccounts, getCreditCardBillsRange } from "../bank/service";
+import { getExchangeRates } from "../exchange-rates/service";
 import { configEncryptionKey } from "../../platform/config";
 import { decryptJson, encryptJson } from "../../platform/crypto";
 import type { Env } from "../../platform/env";
@@ -20,7 +24,7 @@ import {
   upsertPushSubscription,
 } from "./repository";
 import {
-  scheduledSyncSummaryPayload,
+  scheduledSummaryNotification,
   shouldNotify,
   summaryStatus,
   syncNotificationPayload,
@@ -77,6 +81,7 @@ export async function getNotificationConfig(
         success: false,
         failed: true,
         needsUserAction: true,
+        paymentDue: true,
       },
     };
   }
@@ -115,8 +120,16 @@ export async function unregisterPushSubscription(env: Env, id: string) {
 
 export async function updateNotificationPreferences(
   env: Env,
-  preferences: NotificationPreferences,
+  input: Omit<NotificationPreferences, "paymentDue"> & {
+    paymentDue?: boolean;
+  },
 ) {
+  // 尚未更新的已安裝 App 不會送出 paymentDue；保留目前設定。
+  const preferences: NotificationPreferences = {
+    ...input,
+    paymentDue:
+      input.paymentDue ?? (await getNotificationPreferences(env.DB)).paymentDue,
+  };
   await saveNotificationPreferences(
     env.DB,
     preferences,
@@ -169,12 +182,20 @@ export async function safelySendScheduledSyncSummary(
   const status = summaryStatus(events);
   try {
     const preferences = await getNotificationPreferences(env.DB);
-    if (!shouldNotify(preferences, status)) return;
+    const reminders = preferences.paymentDue
+      ? await safelyLoadPaymentReminders(env.DB)
+      : [];
+    const payload = scheduledSummaryNotification(
+      preferences,
+      events,
+      reminders,
+    );
+    if (!payload) return;
     if (!isPushConfigured(env)) {
       console.warn("[notifications] skipped: VAPID keys are not configured");
       return;
     }
-    await deliverPushPayload(env, scheduledSyncSummaryPayload(events));
+    await deliverPushPayload(env, payload);
   } catch (error) {
     const safeError = sanitizeDatabaseError(error);
     console.error(
@@ -186,6 +207,55 @@ export async function safelySendScheduledSyncSummary(
           safeError instanceof Error ? safeError.message : String(safeError),
       }),
     );
+  }
+}
+
+/**
+ * 繳款提醒只是附加資訊；讀取失敗時照常送出同步摘要。匯率只用於外幣款項由
+ * 台幣帳戶扣繳時的換算，讀取失敗時以空匯率表繼續，該類款項維持原提醒。
+ */
+export async function safelyLoadPaymentReminders(
+  db: D1Database,
+  now = new Date(),
+): Promise<PaymentReminder[]> {
+  try {
+    // 本月到期的帳單通常屬於上一或上上期別，與總覽查詢的範圍相同。
+    const [year, month] = taipeiDateKey(now).split("-").map(Number);
+    const monthStart = (offset: number) => {
+      const date = new Date(Date.UTC(year!, month! - 1 + offset, 1));
+      return date.toISOString().slice(0, 10);
+    };
+    const [accounts, bills, rates] = await Promise.all([
+      getBankAccounts(db),
+      getCreditCardBillsRange(db, { from: monthStart(-2), to: monthStart(1) }),
+      getExchangeRates(db).catch((error: unknown) => {
+        const safeError = sanitizeDatabaseError(error);
+        console.error(
+          JSON.stringify({
+            event: "payment_reminder_rates_load_failed",
+            message:
+              safeError instanceof Error
+                ? safeError.message
+                : String(safeError),
+          }),
+        );
+        return [];
+      }),
+    ]);
+    const ratesToTwd = Object.fromEntries(
+      rates.map((rate) => [rate.currency, rate.rateTwd]),
+    );
+    return collectPaymentReminders(accounts, bills, now, ratesToTwd).reminders;
+  } catch (error) {
+    const safeError = sanitizeDatabaseError(error);
+    console.error(
+      JSON.stringify({
+        event: "payment_reminder_load_failed",
+        message:
+          safeError instanceof Error ? safeError.message : String(safeError),
+      }),
+    );
+    return [];
   }
 }
 

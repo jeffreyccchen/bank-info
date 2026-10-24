@@ -1,4 +1,5 @@
 import {
+  deletePaymentAccountOverride,
   listBankAccounts,
   listBankTransactions,
   listBankTransactionsForRefundMatching,
@@ -6,9 +7,16 @@ import {
   listBankTransactionsInRange,
   listCreditCardBills,
   listCreditCardBillsInRange,
+  listPaymentAccountSources,
+  listRecentCreditCards,
+  savePaymentAccountOverride,
   type BankTransactionPageRow,
   type CreditCardBillPageCursor,
 } from "./repository";
+import {
+  assertPaymentAccount,
+  resolvePaymentAccounts,
+} from "./payment-accounts";
 import type { TransactionPageCursor } from "../investments/repository";
 import type { MonthDateRange } from "../../platform/month-range";
 import {
@@ -26,12 +34,14 @@ import {
   listEnabledClassificationRules,
   type ClassificationRuleMatchRow,
 } from "../classification/repository";
+import { listAiClassifications } from "../classification/ai-repository";
 import {
   findAutomaticCreditOffsetTransactionIds,
   findAutomaticTransferTransactionIds,
   getAutomaticTransferDay,
 } from "./transfer-matching";
 import {
+  findSameDayRefundOffsetTransactionIds,
   isRefundCandidate,
   matchRefundsToPurchases,
   refundOriginalDayRange,
@@ -52,8 +62,113 @@ function loadClassificationRules(db: D1Database) {
   return settle(listEnabledClassificationRules(db));
 }
 
-export async function getBankAccounts(db: D1Database) {
-  return (await listBankAccounts(db)).map(normalizeBankAccountDisplay);
+export async function getBankAccounts(db: D1Database, now = new Date()) {
+  const [rows, cards] = await Promise.all([
+    listBankAccounts(db),
+    listRecentCreditCards(db, recentCardsSince(now)),
+  ]);
+  const recentCards = groupRecentCards(cards);
+  return (await presentBankAccounts(db, rows)).map((row) => ({
+    ...row,
+    // 只有信用卡帳戶有此欄位；undefined 在 JSON 回應中省略。
+    recentCards:
+      row.accountType === "credit"
+        ? (recentCards.get(row.id) ?? [])
+        : undefined,
+  }));
+}
+
+/** 近期卡片只看最近 90 天的交易，避免已換發或停用的舊卡一直列出。 */
+const RECENT_CARD_DAYS = 90;
+
+function recentCardsSince(now: Date) {
+  return new Date(now.getTime() - RECENT_CARD_DAYS * 86_400_000)
+    .toISOString()
+    .slice(0, 10);
+}
+
+/**
+ * 同一末四碼可能在部分交易缺卡名；採最近一次有卡名的名稱。
+ * 依最近使用日期排序，同日再依末四碼。
+ */
+function groupRecentCards(
+  rows: Awaited<ReturnType<typeof listRecentCreditCards>>,
+) {
+  const byAccount = new Map<
+    string,
+    Map<
+      string,
+      {
+        last4: string;
+        name: string | null;
+        lastUsedOn: string;
+        namedOn: string;
+      }
+    >
+  >();
+  for (const row of rows) {
+    const cards = byAccount.get(row.accountId) ?? new Map();
+    byAccount.set(row.accountId, cards);
+    const card = cards.get(row.last4) ?? {
+      last4: row.last4,
+      name: null,
+      lastUsedOn: "",
+      namedOn: "",
+    };
+    if (row.lastUsedOn > card.lastUsedOn) card.lastUsedOn = row.lastUsedOn;
+    if (row.name && row.lastUsedOn > card.namedOn) {
+      card.name = row.name;
+      card.namedOn = row.lastUsedOn;
+    }
+    cards.set(row.last4, card);
+  }
+  return new Map(
+    [...byAccount].map(([accountId, cards]) => [
+      accountId,
+      [...cards.values()]
+        .sort(
+          (a, b) =>
+            b.lastUsedOn.localeCompare(a.lastUsedOn) ||
+            a.last4.localeCompare(b.last4),
+        )
+        .map(({ last4, name }) => ({ last4, name })),
+    ]),
+  );
+}
+
+type BankAccountRows = Awaited<ReturnType<typeof listBankAccounts>>;
+
+/** 帳戶顯示名稱正規化，並附上信用卡／貸款的扣款帳戶。 */
+async function presentBankAccounts(db: D1Database, rows: BankAccountRows) {
+  const payment = resolvePaymentAccounts(
+    rows,
+    await listPaymentAccountSources(db),
+  );
+  return rows.map((row) => ({
+    ...normalizeBankAccountDisplay(row),
+    ...payment.get(row.id),
+  }));
+}
+
+/** 手動指定扣款帳戶；paymentAccountId 為 null 表示明確不指定。 */
+export async function setPaymentAccount(
+  db: D1Database,
+  accountId: string,
+  paymentAccountId: string | null,
+) {
+  assertPaymentAccount(await listBankAccounts(db), accountId, paymentAccountId);
+  await savePaymentAccountOverride(
+    db,
+    accountId,
+    paymentAccountId,
+    new Date().toISOString(),
+  );
+}
+
+/** 移除手動設定，改回使用銀行提供的自動扣繳帳戶。 */
+export async function clearPaymentAccount(db: D1Database, accountId: string) {
+  assertPaymentAccount(await listBankAccounts(db), accountId, null);
+  await deletePaymentAccountOverride(db, accountId);
 }
 
 export async function getBankPage(
@@ -71,7 +186,7 @@ export async function getBankPage(
   return {
     hasMore,
     last: page.at(-1),
-    accounts: accounts.map(normalizeBankAccountDisplay),
+    accounts: await presentBankAccounts(db, accounts),
     transactions: await presentBankTransactions(db, page, rules),
   };
 }
@@ -88,7 +203,7 @@ export async function getBankRange(
     listBankTransactionsInRange(db, range, days),
   ]);
   return {
-    accounts: accounts.map(normalizeBankAccountDisplay),
+    accounts: await presentBankAccounts(db, accounts),
     transactions: await presentBankTransactions(db, transactions, rules),
   };
 }
@@ -128,17 +243,27 @@ async function presentBankTransactions(
       transactionsById.set(candidate.id, candidate);
   const transactionsForClassification = [...transactionsById.values()];
   const pageIds = new Set(transactions.map((transaction) => transaction.id));
-  const [rulesResult, pageOverridesResult, candidateOverridesResult] =
-    await Promise.all([
-      rules,
-      pageOverrides,
-      loadClassificationOverrides(
-        db,
-        transactionsForClassification.filter(
-          (transaction) => !pageIds.has(transaction.id),
-        ),
+  const [
+    rulesResult,
+    pageOverridesResult,
+    candidateOverridesResult,
+    aiClassificationsResult,
+  ] = await Promise.all([
+    rules,
+    pageOverrides,
+    loadClassificationOverrides(
+      db,
+      transactionsForClassification.filter(
+        (transaction) => !pageIds.has(transaction.id),
       ),
-    ]);
+    ),
+    settle(
+      listAiClassifications(
+        db,
+        transactionsForClassification.map((transaction) => transaction.id),
+      ),
+    ),
+  ]);
   let classificationMap: Map<string, ClassificationResult>;
   let classificationsReady = true;
   try {
@@ -161,6 +286,24 @@ async function presentBankTransactions(
     classificationMap = new Map();
     classificationsReady = false;
   }
+  // AI results only fill in what overrides and rules left unclassified.
+  if (classificationsReady && aiClassificationsResult.ok) {
+    for (const row of aiClassificationsResult.value) {
+      if (!row.categoryId || !row.label) continue;
+      if (classificationMap.get(row.transactionId)?.source !== "fallback")
+        continue;
+      classificationMap.set(row.transactionId, {
+        categoryId: row.categoryId,
+        label: row.label,
+        source: "ai",
+      });
+    }
+  } else if (!aiClassificationsResult.ok) {
+    console.error(
+      "[classify] load AI classifications failed:",
+      aiClassificationsResult.error,
+    );
+  }
 
   const eligibleTransactions = transferCandidates.filter((transaction) => {
     const classification = classificationMap.get(transaction.id);
@@ -177,23 +320,36 @@ async function presentBankTransactions(
   const automaticCreditOffsetIds = classificationsReady
     ? findAutomaticCreditOffsetTransactionIds(eligibleTransactions)
     : new Set<string>();
+  const calculatedTransactions = transactionsForClassification.filter(
+    (transaction) =>
+      !resolveCalculationExclusion({
+        ...transaction,
+        classificationExcludedFromCalculation: classificationMap.get(
+          transaction.id,
+        )?.excludedFromCalculation,
+      }),
+  );
   const refundPurchaseIds = classificationsReady
-    ? matchRefundsToPurchases(
-        transactions,
-        transactionsForClassification.filter(
-          (transaction) =>
-            !resolveCalculationExclusion({
-              ...transaction,
-              classificationExcludedFromCalculation: classificationMap.get(
-                transaction.id,
-              )?.excludedFromCalculation,
-            }),
-        ),
-      )
+    ? matchRefundsToPurchases(transactions, calculatedTransactions)
     : new Map<string, string>();
+  // Month ranges hold both sides of a same-day pair, so no extra lookup is needed.
+  const sameDayRefundOffsetIds = classificationsReady
+    ? findSameDayRefundOffsetTransactionIds(
+        calculatedTransactions.filter((transaction) => {
+          const classification = classificationMap.get(transaction.id);
+          return (
+            // An explicit include preference or user classification wins.
+            transaction.calculationPreference !== 0 &&
+            classification?.source !== "override" &&
+            classification?.source !== "user_rule"
+          );
+        }),
+      )
+    : new Set<string>();
 
-  // A refund takes its purchase's category. A rule or manual category still
-  // wins, and only counts as a refund when it agrees with the purchase.
+  // A refund takes its purchase's category, also over an AI guess. A rule or
+  // manual category still wins, and only counts as a refund when it agrees
+  // with the purchase.
   const refundClassification = (
     transactionId: string,
   ): ClassificationResult | undefined => {
@@ -201,7 +357,7 @@ async function presentBankTransactions(
     const own = classificationMap.get(transactionId);
     const purchase = purchaseId ? classificationMap.get(purchaseId) : undefined;
     if (!own || !purchase) return own;
-    if (own.source === "fallback")
+    if (own.source === "fallback" || own.source === "ai")
       return {
         categoryId: purchase.categoryId,
         label: purchase.label,
@@ -211,6 +367,13 @@ async function presentBankTransactions(
     return own.categoryId === purchase.categoryId
       ? { ...own, refund: true }
       : own;
+  };
+
+  const refundOrOffsetClassification = (transactionId: string) => {
+    const classification = refundClassification(transactionId);
+    return classification && sameDayRefundOffsetIds.has(transactionId)
+      ? { ...classification, excludedFromCalculation: true }
+      : classification;
   };
 
   return transactions.map(
@@ -233,7 +396,7 @@ async function presentBankTransactions(
               source: "auto_transfer" as const,
               excludedFromCalculation: true,
             }
-          : refundClassification(transaction.id);
+          : refundOrOffsetClassification(transaction.id);
       return {
         ...normalizeBankTransactionDisplay(transaction),
         excludedFromCalculation: resolveCalculationExclusion({

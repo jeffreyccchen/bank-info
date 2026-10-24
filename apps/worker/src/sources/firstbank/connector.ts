@@ -1,3 +1,4 @@
+import type { SourceSyncError, SourceSyncErrorSource } from "../sync-error";
 import type { SyncResult } from "../types";
 import {
   BrowserRunCapacityError,
@@ -178,10 +179,17 @@ type BrowserResponse = {
   text(): Promise<string>;
 };
 
-export class FirstbankVerificationRequiredError extends Error {
+export class FirstbankVerificationRequiredError
+  extends Error
+  implements SourceSyncErrorSource
+{
   constructor(message: string) {
     super(message);
     this.name = "FirstbankVerificationRequiredError";
+  }
+
+  toSyncError(): SourceSyncError {
+    return { status: 400, code: "USER_ACTION_REQUIRED", needsUserAction: true };
   }
 }
 
@@ -216,7 +224,10 @@ class FirstbankAlreadyAuthenticatedError extends Error {
   }
 }
 
-export class FirstbankConnectionError extends Error {
+export class FirstbankConnectionError
+  extends Error
+  implements SourceSyncErrorSource
+{
   constructor(
     message: string,
     readonly sessionCookies?: string,
@@ -227,15 +238,30 @@ export class FirstbankConnectionError extends Error {
     this.name = "FirstbankConnectionError";
     if (cause !== undefined) this.cause = cause;
   }
+
+  toSyncError(): SourceSyncError {
+    return { status: 502, code: "FIRSTBANK_CONNECTION_FAILED" };
+  }
 }
 
-export class FirstbankBrowserCapacityError extends Error {
+export class FirstbankBrowserCapacityError
+  extends Error
+  implements SourceSyncErrorSource
+{
   constructor(
     message: string,
     readonly retryAfterSeconds = 20,
   ) {
     super(message);
     this.name = "FirstbankBrowserCapacityError";
+  }
+
+  toSyncError(): SourceSyncError {
+    return {
+      status: 429,
+      code: "FIRSTBANK_BROWSER_BUSY",
+      retryAfterSeconds: this.retryAfterSeconds,
+    };
   }
 }
 
@@ -1644,40 +1670,6 @@ async function findCardFunctions(frame: Frame) {
       : [];
   } catch {
     return [];
-  }
-}
-
-async function clickText(frame: Frame, label: string) {
-  try {
-    return Boolean(
-      await withActionTimeout(
-        frame.evaluate((targetLabel) => {
-          const normalized = targetLabel.replace(/\s+/g, "").trim();
-          const elements = Array.from(
-            document.querySelectorAll<HTMLElement>(
-              "a,button,input,[role=button],li,span,div",
-            ),
-          );
-          const target = elements.find((element) => {
-            const text = (
-              element.textContent ||
-              (element as HTMLInputElement).value ||
-              ""
-            )
-              .replace(/\s+/g, "")
-              .trim();
-            return text === normalized;
-          });
-          const clickable = target?.closest<HTMLElement>(
-            "a,button,input,[role=button],li",
-          );
-          (clickable || target)?.click();
-          return Boolean(target);
-        }, label),
-      ),
-    );
-  } catch {
-    return false;
   }
 }
 
@@ -3185,17 +3177,6 @@ function isDetachedFrame(frame: Frame) {
 
 function liveFrames(page: Page) {
   return page.frames().filter((frame) => !isDetachedFrame(frame));
-}
-
-function pickLiveFrame(page: Page, preferred?: Frame) {
-  if (
-    preferred &&
-    !isDetachedFrame(preferred) &&
-    liveFrames(page).includes(preferred)
-  ) {
-    return preferred;
-  }
-  return liveFrames(page)[0];
 }
 
 function pickCardNavigationFrame(page: Page, preferred?: Frame) {
